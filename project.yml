@@ -17,3 +17,5 @@ docker:
     base: kt-build-generic-bullseye:master
   run:
     base: kt-run-generic-bullseye:master
+team_mappings:
+- team: infra
