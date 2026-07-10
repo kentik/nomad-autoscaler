@@ -52,6 +52,13 @@ telemetry {
   disable_hostname   = true
 }
 
+policy_eval {
+  workers = {
+    horizontal = 50
+    cluster    = 10
+  }
+}
+
 apm "prometheus" {
   driver = "prometheus"
   config = {
