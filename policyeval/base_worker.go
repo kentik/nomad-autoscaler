@@ -320,7 +320,8 @@ func (w *BaseWorker) scaleTarget(
 
 	err := runTargetScale(targetImpl, policy, action)
 	if err != nil {
-		if _, ok := err.(*sdk.TargetScalingNoOpError); ok {
+		var noOpErr *sdk.TargetScalingNoOpError
+		if errors.As(err, &noOpErr) {
 			logger.Info("scaling action skipped", "reason", err)
 			return nil
 		}

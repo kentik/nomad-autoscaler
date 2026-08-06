@@ -32,7 +32,7 @@ func (p *pluginClient) Scale(action sdk.ScalingAction, config map[string]string)
 		return err
 	}
 	_, err = p.client.Scale(p.doneCTX, &proto.ScaleRequest{Action: req, Config: config})
-	return err
+	return scaleErrorFromStatus(err)
 }
 
 // Status is the gRPC client implementation of the Target.Status interface
