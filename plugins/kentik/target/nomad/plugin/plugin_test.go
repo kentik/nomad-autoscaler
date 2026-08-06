@@ -101,11 +101,11 @@ func TestTargetPlugin_Status_UnknownAllocs(t *testing.T) {
 		"nomad_address": nomadMock.URL,
 	})
 
-	// Unknown allocs still occupy the group count, so they are reported rather
-	// than aborting the evaluation.
+	// Unknown allocs already occupy a slot in the group's configured count, so
+	// the reported count is the configured count.
 	expected := &sdk.TargetStatus{
 		Ready: true,
-		Count: 2,
+		Count: 1,
 		Meta: map[string]string{
 			"nomad_autoscaler.target.nomad.example.stopped": "false",
 		},
@@ -140,7 +140,7 @@ func TestTargetPlugin_Status_UnknownAllocs(t *testing.T) {
 
 func TestTargetPlugin_Status_DisconnectedNodeCountsTowardsGroup(t *testing.T) {
 	// One of three nodes is partitioned, which is below the guard threshold, so
-	// the handler should still report and include the unknown alloc.
+	// the handler should still report the group's configured count.
 	nodes := []testNode{
 		{id: allocNodeID, eligibility: "eligible", status: "disconnected"},
 		{id: "11111111-0000-0000-0000-000000000001", eligibility: "eligible", status: "ready"},
@@ -148,6 +148,44 @@ func TestTargetPlugin_Status_DisconnectedNodeCountsTowardsGroup(t *testing.T) {
 	}
 
 	nomadMock := httptest.NewServer(http.HandlerFunc(statusHandlerForNodes(true, nodes)))
+	defer nomadMock.Close()
+
+	plugin := PluginConfig.Factory(hclog.NewNullLogger()).(*TargetPlugin)
+	plugin.SetConfig(map[string]string{
+		"nomad_address": nomadMock.URL,
+	})
+
+	got, err := plugin.Status(map[string]string{
+		"Job":                "example",
+		"Group":              "cache",
+		"Namespace":          "default",
+		"CheckUnknownAllocs": "true",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(1), got.Count)
+}
+
+func TestTargetPlugin_Status_DegradedJobReportsConfiguredCount(t *testing.T) {
+	// A node was lost and the replacement cannot be placed, so the group is left
+	// with desired=2 running=1. Reporting the running count here would make the
+	// strategy see current==target and never scale the group back down, leaving
+	// the job degraded indefinitely.
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/scale") {
+			scaleStatusHandlerFor(2, 1)(w, r)
+			return
+		} else if strings.HasSuffix(r.URL.Path, "/allocations") {
+			allocsHandler(false)(w, r)
+			return
+		} else if strings.HasSuffix(r.URL.Path, "/nodes") {
+			nodesHandler([]testNode{{id: allocNodeID, eligibility: "eligible", status: "ready"}})(w, r)
+			return
+		}
+	}
+
+	nomadMock := httptest.NewServer(http.HandlerFunc(handler))
 	defer nomadMock.Close()
 
 	plugin := PluginConfig.Factory(hclog.NewNullLogger()).(*TargetPlugin)
@@ -228,7 +266,7 @@ func TestTargetPlugin_Status_UnknownAllocsWithIneligibleNode(t *testing.T) {
 
 	expected := &sdk.TargetStatus{
 		Ready: true,
-		Count: 2, // should count the ineligible node
+		Count: 1,
 		Meta: map[string]string{
 			"nomad_autoscaler.target.nomad.example.stopped": "false",
 		},
@@ -328,8 +366,12 @@ func statusHandlerForNodes(unknownAllocs bool, nodes []testNode) func(w http.Res
 }
 
 func scaleStatusHandler(w http.ResponseWriter, r *http.Request) {
+	scaleStatusHandlerFor(1, 1)(w, r)
+}
 
-	respBody := `
+func scaleStatusHandlerFor(desired, running int) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		respBody := fmt.Sprintf(`
 {
   "JobCreateIndex": 10,
   "JobID": "example",
@@ -338,16 +380,17 @@ func scaleStatusHandler(w http.ResponseWriter, r *http.Request) {
   "JobStopped": false,
   "TaskGroups": {
     "cache": {
-      "Desired": 1,
+      "Desired": %d,
       "Events": null,
-      "Healthy": 1,
-      "Placed": 1,
-      "Running": 1,
+      "Healthy": %d,
+      "Placed": %d,
+      "Running": %d,
       "Unhealthy": 0
     }
   }
-}`
-	w.Write([]byte(respBody))
+}`, desired, running, running, running)
+		w.Write([]byte(respBody))
+	}
 }
 
 func allocsHandler(unknownAllocs bool) func(w http.ResponseWriter, r *http.Request) {

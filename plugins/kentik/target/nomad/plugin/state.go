@@ -162,30 +162,26 @@ func (jsh *jobScaleStatusHandler) status(group string) (*sdk.TargetStatus, error
 		return nil, fmt.Errorf("task group %q not found", group)
 	}
 
-	count := int64(status.Running)
+	// Report the group's configured count rather than how many allocs are
+	// running. The strategy does nothing when the reported count already equals
+	// the target, so reporting `Running` during an outage makes current==target
+	// and the count is never corrected back down, leaving the job degraded.
+	// Unknown allocs already occupy a slot in Desired, so they need no adjustment.
+	count := int64(status.Desired)
 
-	// Nomad's scale status counts only ClientStatus==running, but unknown allocs
-	// are non-terminal and still occupy the group's count. Omitting them would
-	// make current==target, so the autoscaler would never lower the count and
-	// Nomad would keep retrying placements the group's constraints cannot
-	// satisfy.
 	if unknown, exists := jsh.unknownAllocs[group]; exists {
-		jsh.logger.Info("including unknown allocs in reported count",
-			"group", group, "unknown", unknown, "running", count)
-		count += int64(unknown)
+		jsh.logger.Info("group has unknown allocs on connected nodes",
+			"group", group, "unknown", unknown, "desired", count)
 	}
 
 	if ineligible, exists := jsh.ineligibleUnknownAllocs[group]; exists {
-		jsh.logger.Info(
-			"adjusting target count since group has unknown allocs running on ineligible nodes. APM plugin should force a downscale",
-			"group", group,
-			"ineligible", ineligible,
-			"count", count,
-		)
-		count += int64(ineligible)
+		jsh.logger.Info("group has unknown allocs on ineligible nodes",
+			"group", group, "ineligible", ineligible, "desired", count)
 	}
+
 	if status.Desired > status.Running {
-		jsh.logger.Warn("desired count is bigger than running count, job is probably degraded", group, group, "desired", status.Desired, "running", status.Running)
+		jsh.logger.Warn("desired count is bigger than running count, job is probably degraded",
+			"group", group, "desired", status.Desired, "running", status.Running)
 	}
 
 	// Hydrate the response object with the information we have collected that
