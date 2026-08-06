@@ -101,6 +101,16 @@ func TestTargetPlugin_Status_UnknownAllocs(t *testing.T) {
 		"nomad_address": nomadMock.URL,
 	})
 
+	// Unknown allocs still occupy the group count, so they are reported rather
+	// than aborting the evaluation.
+	expected := &sdk.TargetStatus{
+		Ready: true,
+		Count: 2,
+		Meta: map[string]string{
+			"nomad_autoscaler.target.nomad.example.stopped": "false",
+		},
+	}
+
 	got, err := plugin.Status(map[string]string{
 		"Job":                "example",
 		"Group":              "cache",
@@ -108,8 +118,8 @@ func TestTargetPlugin_Status_UnknownAllocs(t *testing.T) {
 		"CheckUnknownAllocs": "true",
 	})
 
-	assert.Nil(t, got)
-	assert.Error(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, expected, got)
 
 	// Call Status multiple times concurrently to test for data races.
 	var wg sync.WaitGroup
@@ -122,10 +132,89 @@ func TestTargetPlugin_Status_UnknownAllocs(t *testing.T) {
 				"Group":     "cache",
 				"Namespace": "default",
 			})
-			assert.Error(t, err)
+			assert.NoError(t, err)
 		}()
 	}
 	wg.Wait()
+}
+
+func TestTargetPlugin_Status_DisconnectedNodeCountsTowardsGroup(t *testing.T) {
+	// One of three nodes is partitioned, which is below the guard threshold, so
+	// the handler should still report and include the unknown alloc.
+	nodes := []testNode{
+		{id: allocNodeID, eligibility: "eligible", status: "disconnected"},
+		{id: "11111111-0000-0000-0000-000000000001", eligibility: "eligible", status: "ready"},
+		{id: "11111111-0000-0000-0000-000000000002", eligibility: "eligible", status: "ready"},
+	}
+
+	nomadMock := httptest.NewServer(http.HandlerFunc(statusHandlerForNodes(true, nodes)))
+	defer nomadMock.Close()
+
+	plugin := PluginConfig.Factory(hclog.NewNullLogger()).(*TargetPlugin)
+	plugin.SetConfig(map[string]string{
+		"nomad_address": nomadMock.URL,
+	})
+
+	got, err := plugin.Status(map[string]string{
+		"Job":                "example",
+		"Group":              "cache",
+		"Namespace":          "default",
+		"CheckUnknownAllocs": "true",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(2), got.Count)
+}
+
+func TestTargetPlugin_Status_RefusesWhenMajorityUnavailable(t *testing.T) {
+	// Two of three nodes unavailable exceeds the default 0.5 threshold, which
+	// most likely means the control plane lost visibility rather than that the
+	// capacity is genuinely gone.
+	nodes := []testNode{
+		{id: allocNodeID, eligibility: "eligible", status: "disconnected"},
+		{id: "11111111-0000-0000-0000-000000000001", eligibility: "eligible", status: "down"},
+		{id: "11111111-0000-0000-0000-000000000002", eligibility: "eligible", status: "ready"},
+	}
+
+	nomadMock := httptest.NewServer(http.HandlerFunc(statusHandlerForNodes(true, nodes)))
+	defer nomadMock.Close()
+
+	plugin := PluginConfig.Factory(hclog.NewNullLogger()).(*TargetPlugin)
+	plugin.SetConfig(map[string]string{
+		"nomad_address": nomadMock.URL,
+	})
+
+	got, err := plugin.Status(map[string]string{
+		"Job":                "example",
+		"Group":              "cache",
+		"Namespace":          "default",
+		"CheckUnknownAllocs": "true",
+	})
+
+	assert.Nil(t, got)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nodes unavailable")
+}
+
+func TestTargetPlugin_Status_InvalidMaxUnavailableFraction(t *testing.T) {
+	nomadMock := httptest.NewServer(http.HandlerFunc(statusHandler(false, false)))
+	defer nomadMock.Close()
+
+	plugin := PluginConfig.Factory(hclog.NewNullLogger()).(*TargetPlugin)
+	plugin.SetConfig(map[string]string{
+		"nomad_address": nomadMock.URL,
+	})
+
+	_, err := plugin.Status(map[string]string{
+		"Job":                    "example",
+		"Group":                  "cache",
+		"Namespace":              "default",
+		"MaxUnavailableFraction": "not-a-float",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a float")
 }
 
 func TestTargetPlugin_Status_UnknownAllocsWithIneligibleNode(t *testing.T) {
@@ -203,7 +292,27 @@ func TestTargetPlugin_statusTimeout(t *testing.T) {
 	assert.Nil(t, status)
 }
 
+// allocNodeID is the node the allocation fixture is placed on.
+const allocNodeID = "cb1f6030-a220-4f92-57dc-7baaabdc3823"
+
+type testNode struct {
+	id          string
+	eligibility string
+	status      string
+}
+
 func statusHandler(unknownAllocs, ineligibleNodes bool) func(w http.ResponseWriter, r *http.Request) {
+	eligibility := "eligible"
+	if ineligibleNodes {
+		eligibility = "ineligible"
+	}
+
+	return statusHandlerForNodes(unknownAllocs, []testNode{
+		{id: allocNodeID, eligibility: eligibility, status: "ready"},
+	})
+}
+
+func statusHandlerForNodes(unknownAllocs bool, nodes []testNode) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/scale") {
 			scaleStatusHandler(w, r)
@@ -212,7 +321,7 @@ func statusHandler(unknownAllocs, ineligibleNodes bool) func(w http.ResponseWrit
 			allocsHandler(unknownAllocs)(w, r)
 			return
 		} else if strings.HasSuffix(r.URL.Path, "/nodes") {
-			nodesHandler(ineligibleNodes)(w, r)
+			nodesHandler(nodes)(w, r)
 			return
 		}
 	}
@@ -280,15 +389,12 @@ func allocsHandler(unknownAllocs bool) func(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-func nodesHandler(ineligibleNodes bool) func(w http.ResponseWriter, r *http.Request) {
+func nodesHandler(nodes []testNode) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		status := "eligible"
-		if ineligibleNodes {
-			status = "ineligible"
-		}
+		stubs := make([]string, 0, len(nodes))
 
-		respBody := fmt.Sprintf(`
-[
+		for _, nd := range nodes {
+			stubs = append(stubs, fmt.Sprintf(`
   {
     "Address": "10.138.0.5",
     "Attributes": {
@@ -297,31 +403,19 @@ func nodesHandler(ineligibleNodes bool) func(w http.ResponseWriter, r *http.Requ
     "CreateIndex": 6,
     "Datacenter": "dc1",
     "Drain": false,
-    "Drivers": {
-      "docker": {
-        "Attributes": {
-          "driver.docker.bridge_ip": "172.17.0.1",
-          "driver.docker.version": "18.03.0-ce",
-          "driver.docker.volumes.enabled": "1"
-        },
-        "Detected": true,
-        "HealthDescription": "Driver is available and responsive",
-        "Healthy": true,
-        "UpdateTime": "2018-04-11T23:34:48.713720323Z"
-      }
-    },
-    "ID": "cb1f6030-a220-4f92-57dc-7baaabdc3823",
+    "ID": %q,
     "LastDrain": null,
     "ModifyIndex": 2526,
-    "Name": "nomad-4",
+    "Name": %q,
     "NodeClass": "",
-    "SchedulingEligibility": "%s",
-    "Status": "ready",
+    "SchedulingEligibility": %q,
+    "Status": %q,
     "StatusDescription": "",
     "Version": "0.8.0-rc1"
-  }
-]`, status)
-		_, _ = w.Write([]byte(respBody))
+  }`, nd.id, nd.id, nd.eligibility, nd.status))
+		}
+
+		_, _ = w.Write([]byte("[" + strings.Join(stubs, ",") + "]"))
 	}
 }
 

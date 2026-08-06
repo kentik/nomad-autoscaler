@@ -5,6 +5,7 @@
 //
 //	mockgen -destination=../../mocks/pkg/node/node.go . Status
 //
+
 // Package mock_node is a generated GoMock package.
 package mock_node
 
@@ -18,6 +19,7 @@ import (
 type MockStatus struct {
 	ctrl     *gomock.Controller
 	recorder *MockStatusMockRecorder
+	isgomock struct{}
 }
 
 // MockStatusMockRecorder is the mock recorder for MockStatus.
@@ -38,15 +40,44 @@ func (m *MockStatus) EXPECT() *MockStatusMockRecorder {
 }
 
 // IsIneligible mocks base method.
-func (m *MockStatus) IsIneligible(arg0 string) bool {
+func (m *MockStatus) IsIneligible(nodeID string) bool {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "IsIneligible", arg0)
+	ret := m.ctrl.Call(m, "IsIneligible", nodeID)
 	ret0, _ := ret[0].(bool)
 	return ret0
 }
 
 // IsIneligible indicates an expected call of IsIneligible.
-func (mr *MockStatusMockRecorder) IsIneligible(arg0 any) *gomock.Call {
+func (mr *MockStatusMockRecorder) IsIneligible(nodeID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsIneligible", reflect.TypeOf((*MockStatus)(nil).IsIneligible), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsIneligible", reflect.TypeOf((*MockStatus)(nil).IsIneligible), nodeID)
+}
+
+// IsUnavailable mocks base method.
+func (m *MockStatus) IsUnavailable(nodeID string) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsUnavailable", nodeID)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsUnavailable indicates an expected call of IsUnavailable.
+func (mr *MockStatusMockRecorder) IsUnavailable(nodeID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsUnavailable", reflect.TypeOf((*MockStatus)(nil).IsUnavailable), nodeID)
+}
+
+// Stats mocks base method.
+func (m *MockStatus) Stats() (int, int) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Stats")
+	ret0, _ := ret[0].(int)
+	ret1, _ := ret[1].(int)
+	return ret0, ret1
+}
+
+// Stats indicates an expected call of Stats.
+func (mr *MockStatusMockRecorder) Stats() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stats", reflect.TypeOf((*MockStatus)(nil).Stats))
 }

@@ -59,7 +59,7 @@ func Test_newJobStateHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create the new handler and perform assertions.
-	jsh, err := newJobScaleStatusHandler(c, "default", "test", false, hclog.NewNullLogger(), nodeStatus)
+	jsh, err := newJobScaleStatusHandler(c, "default", "test", false, defaultMaxUnavailableFraction, hclog.NewNullLogger(), nodeStatus)
 	require.NoError(t, err)
 
 	assert.NotNil(t, jsh.client)

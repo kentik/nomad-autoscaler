@@ -49,6 +49,10 @@ type jobScaleStatusHandler struct {
 	jobID              string
 	checkUnknownAllocs bool
 
+	// maxUnavailableFraction is the share of cluster nodes allowed to be
+	// unavailable before this handler stops reporting status. Zero disables it.
+	maxUnavailableFraction float64
+
 	// lock is used to synchronize access to the status variables below.
 	lock sync.RWMutex
 
@@ -74,13 +78,14 @@ type jobScaleStatusHandler struct {
 	lastUpdated int64
 }
 
-func newJobScaleStatusHandler(client *api.Client, ns, jobID string, checkUnknownAllocs bool, logger hclog.Logger, nodes node.Status) (*jobScaleStatusHandler, error) {
+func newJobScaleStatusHandler(client *api.Client, ns, jobID string, checkUnknownAllocs bool, maxUnavailableFraction float64, logger hclog.Logger, nodes node.Status) (*jobScaleStatusHandler, error) {
 	jsh := &jobScaleStatusHandler{
 		client:                  client,
 		initialDone:             make(chan bool),
 		jobID:                   jobID,
 		namespace:               ns,
 		checkUnknownAllocs:      checkUnknownAllocs,
+		maxUnavailableFraction:  maxUnavailableFraction,
 		logger:                  logger.With(configKeyJobID, jobID),
 		nodes:                   nodes,
 		ineligibleUnknownAllocs: IneligibleUnknownAllocs{},
@@ -117,9 +122,18 @@ func (jsh *jobScaleStatusHandler) status(group string) (*sdk.TargetStatus, error
 			jsh.logger.Info("returning alloc status error")
 			return nil, jsh.allocStatusError
 		}
-		if count, exists := jsh.unknownAllocs[group]; exists {
-			jsh.logger.Info("returning status error because there are unknown allocs")
-			return nil, fmt.Errorf("group %s contains %d unknown allocs", group, count)
+
+		// Losing sight of a large share of the fleet at once is far more likely
+		// to be a control plane problem than real capacity loss, and acting on
+		// that reading would shrink every job in the cluster simultaneously.
+		if total, unavailable := jsh.nodes.Stats(); jsh.maxUnavailableFraction > 0 &&
+			total > 0 && float64(unavailable)/float64(total) > jsh.maxUnavailableFraction {
+			jsh.logger.Warn("refusing to report status, too many nodes unavailable",
+				"unavailable", unavailable, "total", total,
+				"threshold", jsh.maxUnavailableFraction)
+			return nil, fmt.Errorf(
+				"refusing to report status: %d of %d nodes unavailable, above threshold %.2f",
+				unavailable, total, jsh.maxUnavailableFraction)
 		}
 	}
 
@@ -149,6 +163,17 @@ func (jsh *jobScaleStatusHandler) status(group string) (*sdk.TargetStatus, error
 	}
 
 	count := int64(status.Running)
+
+	// Nomad's scale status counts only ClientStatus==running, but unknown allocs
+	// are non-terminal and still occupy the group's count. Omitting them would
+	// make current==target, so the autoscaler would never lower the count and
+	// Nomad would keep retrying placements the group's constraints cannot
+	// satisfy.
+	if unknown, exists := jsh.unknownAllocs[group]; exists {
+		jsh.logger.Info("including unknown allocs in reported count",
+			"group", group, "unknown", unknown, "running", count)
+		count += int64(unknown)
+	}
 
 	if ineligible, exists := jsh.ineligibleUnknownAllocs[group]; exists {
 		jsh.logger.Info(

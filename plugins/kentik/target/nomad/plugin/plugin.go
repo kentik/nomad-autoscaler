@@ -5,6 +5,7 @@ package nomad
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,14 @@ const (
 	configKeyNamespace       = "Namespace"
 	configCheckUnknownAllocs = "CheckUnknownAllocs"
 	configNodePool           = "NodePool"
+
+	// configMaxUnavailableFraction bounds how much of the cluster may be
+	// unavailable before the plugin stops reporting status.
+	configMaxUnavailableFraction = "MaxUnavailableFraction"
+
+	// defaultMaxUnavailableFraction is deliberately permissive enough to allow
+	// a single datacenter loss to be handled, but not a majority outage.
+	defaultMaxUnavailableFraction = 0.5
 
 	// garbageCollectionNanoSecondThreshold is the nanosecond threshold used
 	// when performing garbage collection of job status handlers.
@@ -209,6 +218,16 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 		checkUnknownAllocs = true
 	}
 
+	maxUnavailableFraction := defaultMaxUnavailableFraction
+
+	if raw, ok := config[configMaxUnavailableFraction]; ok {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("config key %q must be a float: %v", configMaxUnavailableFraction, err)
+		}
+		maxUnavailableFraction = parsed
+	}
+
 	nsID := namespacedJobID{namespace: namespace, job: jobID}
 
 	// Create a read/write lock on the handlers so we can safely interact.
@@ -217,7 +236,7 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 
 	// Create a handler for the job if one does not currently exist.
 	if _, ok := t.statusHandlers[nsID]; !ok {
-		jsh, err := newJobScaleStatusHandler(t.client, namespace, jobID, checkUnknownAllocs, t.logger, t.nodeWatcher)
+		jsh, err := newJobScaleStatusHandler(t.client, namespace, jobID, checkUnknownAllocs, maxUnavailableFraction, t.logger, t.nodeWatcher)
 		if err != nil {
 			return nil, err
 		}

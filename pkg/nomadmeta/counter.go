@@ -89,7 +89,11 @@ func (n *nodeCounter) list(filter, nodePool, token string) ([]string, string, er
 	var nodes []string
 
 	for _, nd := range nodeList {
-		if nd.Status == "down" {
+		// A partitioned client reports "disconnected" for the whole
+		// disconnect.lost_after window before it becomes "down". Counting it as
+		// capacity keeps the target inflated until expiry, then drops it in one
+		// step across every job at once.
+		if nd.Status == api.NodeStatusDown || nd.Status == api.NodeStatusDisconnected {
 			continue
 		}
 		if nd.NodePool == nodePool || nodePool == nodePoolAllNodes {
