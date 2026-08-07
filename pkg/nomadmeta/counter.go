@@ -89,11 +89,11 @@ func (n *nodeCounter) list(filter, nodePool, token string) ([]string, string, er
 	var nodes []string
 
 	for _, nd := range nodeList {
-		// A partitioned client reports "disconnected" for the whole
-		// disconnect.lost_after window before it becomes "down". Counting it as
-		// capacity keeps the target inflated until expiry, then drops it in one
-		// step across every job at once.
-		if nd.Status == api.NodeStatusDown || nd.Status == api.NodeStatusDisconnected {
+		// Only "down" means the capacity is gone. A "disconnected" node is still
+		// inside its disconnect.lost_after window and its allocs can reconnect, so
+		// it has to keep counting or the autoscaler frees a slot that the
+		// returning alloc still needs, and Nomad kills it on reconnect.
+		if nd.Status == api.NodeStatusDown {
 			continue
 		}
 		if nd.NodePool == nodePool || nodePool == nodePoolAllNodes {

@@ -34,7 +34,7 @@ func nodeListServer(t *testing.T, nodes []counterTestNode) *httptest.Server {
 	}))
 }
 
-func TestNodeCounter_GetNodeNames_ExcludesUnavailable(t *testing.T) {
+func TestNodeCounter_GetNodeNames_ExcludesDownKeepsDisconnected(t *testing.T) {
 	server := nodeListServer(t, []counterTestNode{
 		{name: "ready-1", status: api.NodeStatusReady},
 		{name: "ready-2", status: api.NodeStatusReady},
@@ -54,15 +54,16 @@ func TestNodeCounter_GetNodeNames_ExcludesUnavailable(t *testing.T) {
 	names, err := counter.GetNodeNames("", "default")
 	require.NoError(t, err)
 
-	// A partitioned client reports "disconnected" for the whole lost_after
-	// window, so counting it would keep the target inflated until expiry.
-	assert.ElementsMatch(t, []string{"ready-1", "ready-2", "starting"}, names)
+	// Dropping the disconnected node here would lower the target while its allocs
+	// are still holding their slots, so the autoscaler would scale the group down
+	// and Nomad would kill those allocs when the node came back.
+	assert.ElementsMatch(t, []string{"ready-1", "ready-2", "partitioned", "starting"}, names)
 }
 
 func TestNodeCounter_GetNodeNames_AllNodePools(t *testing.T) {
 	server := nodeListServer(t, []counterTestNode{
 		{name: "ready-1", status: api.NodeStatusReady},
-		{name: "partitioned", status: api.NodeStatusDisconnected},
+		{name: "gone", status: api.NodeStatusDown},
 	})
 	defer server.Close()
 
