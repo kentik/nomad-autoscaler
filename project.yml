@@ -11,7 +11,7 @@ lint:
 nomad:
   - service_group: nomad-autoscaler
     pack: service
-    branch: bv-disconnect
+    branch: main
 docker:
   build:
     base: kt-build-generic-bullseye:master
