@@ -42,7 +42,6 @@ func Test_scaleErrorRoundTrip(t *testing.T) {
 			assertFn: func(t *testing.T, got error) {
 				var noOpErr *sdk.TargetScalingNoOpError
 				require.Error(t, got)
-				assert.NotErrorIs(t, got, noOpErr)
 				assert.False(t, errors.As(got, &noOpErr))
 			},
 		},
