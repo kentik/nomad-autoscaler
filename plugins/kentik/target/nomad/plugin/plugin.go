@@ -225,6 +225,10 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 		if err != nil {
 			return nil, fmt.Errorf("config key %q must be a float: %v", configMaxUnavailableFraction, err)
 		}
+		// Reject NaN/Inf and out-of-range values; 0 disables the guard.
+		if parsed != parsed || parsed < 0 || parsed > 1 {
+			return nil, fmt.Errorf("config key %q must be between 0 and 1 (inclusive), got %q", configMaxUnavailableFraction, raw)
+		}
 		maxUnavailableFraction = parsed
 	}
 
