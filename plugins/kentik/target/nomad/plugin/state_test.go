@@ -59,7 +59,7 @@ func Test_newJobStateHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create the new handler and perform assertions.
-	jsh, err := newJobScaleStatusHandler(c, "default", "test", false, hclog.NewNullLogger(), nodeStatus)
+	jsh, err := newJobScaleStatusHandler(c, "default", "test", false, defaultMaxUnavailableFraction, hclog.NewNullLogger(), nodeStatus)
 	require.NoError(t, err)
 
 	assert.NotNil(t, jsh.client)
@@ -107,7 +107,7 @@ func Test_jobStateHandler_status(t *testing.T) {
 				scaleStatus: &api.JobScaleStatusResponse{
 					JobStopped: false,
 					TaskGroups: map[string]api.TaskGroupScaleStatus{
-						"this-does-exist": {Running: 7},
+						"this-does-exist": {Desired: 7, Running: 7},
 					},
 				},
 			},
@@ -126,9 +126,30 @@ func Test_jobStateHandler_status(t *testing.T) {
 			inputJSH: &jobScaleStatusHandler{
 				jobID: "cant-think-of-a-funny-name",
 				scaleStatus: &api.JobScaleStatusResponse{
+					JobStopped: false,
+					TaskGroups: map[string]api.TaskGroupScaleStatus{
+						"this-does-exist": {Desired: 2, Running: 1},
+					},
+				},
+			},
+			inputGroup: "this-does-exist",
+			expectedReturn: &sdk.TargetStatus{
+				Ready: true,
+				Count: 2,
+				Meta: map[string]string{
+					"nomad_autoscaler.target.nomad.cant-think-of-a-funny-name.stopped": "false",
+				},
+			},
+			expectedError: nil,
+			name:          "degraded group reports the configured count so it can be corrected",
+		},
+		{
+			inputJSH: &jobScaleStatusHandler{
+				jobID: "cant-think-of-a-funny-name",
+				scaleStatus: &api.JobScaleStatusResponse{
 					JobStopped: true,
 					TaskGroups: map[string]api.TaskGroupScaleStatus{
-						"this-does-exist": {Running: 7},
+						"this-does-exist": {Desired: 7, Running: 7},
 					},
 				},
 			},

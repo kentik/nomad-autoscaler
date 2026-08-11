@@ -14,6 +14,8 @@ import (
 
 type Status interface {
 	IsIneligible(nodeID string) bool
+	IsUnavailable(nodeID string) bool
+	Stats() (total int, unavailable int)
 }
 
 type NodeStatusWatcher struct {
@@ -32,7 +34,13 @@ type NodeStatusWatcher struct {
 	lastUpdated int64
 
 	ineligibleNodes map[string]struct{}
-	mw              sync.RWMutex // protects ineligibleNodes and isRunning
+
+	// unavailableNodes holds nodes that cannot host allocations, whether the
+	// client is down or only partitioned away from the servers.
+	unavailableNodes map[string]struct{}
+	totalNodes       int
+
+	mw sync.RWMutex // protects the node maps, totalNodes and isRunning
 }
 
 var (
@@ -126,6 +134,21 @@ func (n *NodeStatusWatcher) IsIneligible(nodeID string) bool {
 	return exists
 }
 
+func (n *NodeStatusWatcher) IsUnavailable(nodeID string) bool {
+	n.mw.RLock()
+	defer n.mw.RUnlock()
+
+	_, exists := n.unavailableNodes[nodeID]
+	return exists
+}
+
+func (n *NodeStatusWatcher) Stats() (int, int) {
+	n.mw.RLock()
+	defer n.mw.RUnlock()
+
+	return n.totalNodes, len(n.unavailableNodes)
+}
+
 func (n *NodeStatusWatcher) SetClient(client *api.Client) {
 	n.mw.Lock()
 	defer n.mw.Unlock()
@@ -150,12 +173,23 @@ func (n *NodeStatusWatcher) updateState(nodes []*api.NodeListStub, err error) {
 	}
 
 	before := len(n.ineligibleNodes)
+	beforeUnavailable := len(n.unavailableNodes)
+
 	n.ineligibleNodes = filterIneligibleNodes(nodes)
+	n.unavailableNodes = filterUnavailableNodes(nodes)
+	n.totalNodes = len(nodes)
 	n.lastUpdated = time.Now().UTC().UnixNano()
+
 	after := len(n.ineligibleNodes)
+	afterUnavailable := len(n.unavailableNodes)
 
 	if before != after {
 		n.logger.Info("updating ineligible status", "ineligible", after)
+	}
+
+	if beforeUnavailable != afterUnavailable {
+		n.logger.Info("updating unavailable status",
+			"unavailable", afterUnavailable, "total", n.totalNodes)
 	}
 }
 
@@ -165,6 +199,8 @@ func (n *NodeStatusWatcher) setStopState() {
 
 	n.isRunning = false
 	n.ineligibleNodes = nil
+	n.unavailableNodes = nil
+	n.totalNodes = 0
 	n.lastUpdated = time.Now().UTC().UnixNano()
 }
 
@@ -182,4 +218,20 @@ func filterIneligibleNodes(nodes []*api.NodeListStub) map[string]struct{} {
 	}
 
 	return ineligible
+}
+
+// filterUnavailableNodes returns nodes that cannot host allocations. A
+// partitioned client reports "disconnected" and only becomes "down" once its
+// disconnect.lost_after window expires, so both must be treated as lost
+// capacity to avoid a cliff-edge count drop at expiry.
+func filterUnavailableNodes(nodes []*api.NodeListStub) map[string]struct{} {
+	unavailable := make(map[string]struct{})
+
+	for _, node := range nodes {
+		if node.Status == api.NodeStatusDown || node.Status == api.NodeStatusDisconnected {
+			unavailable[node.ID] = struct{}{}
+		}
+	}
+
+	return unavailable
 }

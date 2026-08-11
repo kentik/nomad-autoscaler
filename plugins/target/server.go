@@ -24,7 +24,12 @@ func (p *pluginServer) Scale(_ context.Context, req *proto.ScaleRequest) (*proto
 	if err != nil {
 		return nil, err
 	}
-	return &proto.ScaleResponse{}, p.impl.Scale(action, req.GetConfig())
+
+	if err := p.impl.Scale(action, req.GetConfig()); err != nil {
+		return nil, scaleErrorToStatus(err)
+	}
+
+	return &proto.ScaleResponse{}, nil
 }
 
 // Status is the gRPC server implementation of the Target.Status interface
