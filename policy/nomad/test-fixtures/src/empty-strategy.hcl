@@ -1,9 +1,8 @@
-# Copyright (c) HashiCorp, Inc.
+# Copyright IBM Corp. 2020, 2025
 # SPDX-License-Identifier: MPL-2.0
 
 job "empty-strategy" {
-  datacenters = ["dc1"]
-  type        = "batch"
+  type = "batch"
 
   group "test" {
     scaling {

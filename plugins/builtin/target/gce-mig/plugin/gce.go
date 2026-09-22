@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package plugin
@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/mitchellh/go-homedir"
@@ -18,9 +18,6 @@ import (
 )
 
 const (
-	defaultRetryInterval = 10 * time.Second
-	defaultRetryLimit    = 15
-
 	// nodeAttrGCEHostname is the node attribute to use when identifying the
 	// GCE hostname of a node.
 	nodeAttrGCEHostname = "unique.platform.gce.hostname"
@@ -39,6 +36,11 @@ func (t *TargetPlugin) setupGCEClients(config map[string]string) error {
 			return fmt.Errorf("failed to read credentials: %v", err)
 		}
 
+		// option.WithCredentialsJSON and all google.CredentialsFromJSON* variants are
+		// deprecated due to a potential security risk when accepting credential configs
+		// from untrusted sources. In this case, credentials come from the Nomad
+		// operator's own config and are trusted, so the deprecation does not apply.
+		//lint:ignore SA1019 no non-deprecated API exists for loading explicit JSON credentials
 		t.service, err = compute.NewService(context.Background(), option.WithCredentialsJSON([]byte(contents)))
 		if err != nil {
 			return fmt.Errorf("failed to create Google Compute Engine client: %v", err)
@@ -55,16 +57,36 @@ func (t *TargetPlugin) setupGCEClients(config map[string]string) error {
 	return nil
 }
 
+// resolveRetryAttempts checks if policy overrides the plugin configuration for retry_attempts
+// and returns the resolved value.
+func (t *TargetPlugin) resolveRetryAttempts(config map[string]string) (int, error) {
+	retryAttempts := t.retryAttempts
+	if str, ok := config[configKeyRetryAttempts]; ok {
+		attempts, err := strconv.Atoi(str)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse %s value from policy: %w", configKeyRetryAttempts, err)
+		}
+		retryAttempts = attempts
+	}
+	return retryAttempts, nil
+}
+
 func (t *TargetPlugin) status(ctx context.Context, ig instanceGroup) (bool, int64, error) {
 	return ig.status(ctx, t.service)
 }
 
-func (t *TargetPlugin) scaleOut(ctx context.Context, ig instanceGroup, num int64) error {
+func (t *TargetPlugin) scaleOut(ctx context.Context, ig instanceGroup, num int64, config map[string]string) error {
 	log := t.logger.With("action", "scale_out", "instance_group", ig.getName())
 	if err := ig.resize(ctx, t.service, num); err != nil {
 		return fmt.Errorf("failed to scale out GCE Instance Group: %v", err)
 	}
-	if err := t.ensureInstanceGroupIsStable(ctx, ig); err != nil {
+
+	retryAttempts, err := t.resolveRetryAttempts(config)
+	if err != nil {
+		return err
+	}
+
+	if err := t.ensureInstanceGroupIsStable(ctx, ig, retryAttempts); err != nil {
 		return fmt.Errorf("failed to confirm scale out GCE Instance Group: %v", err)
 	}
 	log.Debug("scale out GCE MIG confirmed")
@@ -117,7 +139,12 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, group instanceGroup, num int
 
 	log.Info("successfully deleted GCE MIG instances")
 
-	if err := t.ensureInstanceGroupIsStable(ctx, group); err != nil {
+	retryAttempts, err := t.resolveRetryAttempts(config)
+	if err != nil {
+		return err
+	}
+
+	if err := t.ensureInstanceGroupIsStable(ctx, group, retryAttempts); err != nil {
 		return fmt.Errorf("failed to confirm scale in GCE MIG: %v", err)
 	}
 
@@ -131,7 +158,7 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, group instanceGroup, num int
 	return nil
 }
 
-func (t *TargetPlugin) ensureInstanceGroupIsStable(ctx context.Context, group instanceGroup) error {
+func (t *TargetPlugin) ensureInstanceGroupIsStable(ctx context.Context, group instanceGroup, retryAttempts int) error {
 
 	f := func(ctx context.Context) (bool, error) {
 		stable, _, err := group.status(ctx, t.service)
@@ -142,7 +169,9 @@ func (t *TargetPlugin) ensureInstanceGroupIsStable(ctx context.Context, group in
 		}
 	}
 
-	return retry(ctx, defaultRetryInterval, defaultRetryLimit, f)
+	t.logger.Info("waiting for instance group stability", "mig_name", group.getName())
+
+	return retry(ctx, defaultRetryInterval, retryAttempts, f)
 }
 
 func pathOrContents(poc string) (string, error) {

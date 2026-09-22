@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package target
@@ -50,6 +50,10 @@ type Target interface {
 	// Embed base.Base ensuring that strategy plugins implement this interface.
 	base.Base
 
+	Controller
+}
+
+type Controller interface {
 	// Scale triggers a scaling action against the remote target as specified
 	// by the config func argument.
 	Scale(action sdk.ScalingAction, config map[string]string) error

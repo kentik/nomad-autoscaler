@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package sdk
@@ -41,13 +41,12 @@ type ScalingAction struct {
 	Error bool
 
 	// Direction is the scaling direction the strategy has decided should
-	// happen. This is particularly helpful for non-Nomad target
-	// implementations whose APIs dead with increment changes rather than
-	// absolute counts.
+	// happen. This is particularly helpful for non-Nomad target implementations
+	// whose APIs deal with increment changes rather than absolute counts.
 	Direction ScaleDirection
 
 	// Meta
-	Meta map[string]interface{}
+	Meta map[string]any
 }
 
 // ScaleDirection is an identifier used by strategy plugins to identify how the
@@ -68,6 +67,10 @@ const (
 	// ScaleDirectionUp indicates the target should increase the number of
 	// running instances of the resource.
 	ScaleDirectionUp
+
+	// ScaleDirectionRecommendation indicates the plugin has made a
+	// recommendation but the autoscaler should not trigger a target plugin
+	ScaleDirectionRecommendation = 127
 )
 
 // String satisfies the Stringer interface and returns as string representation
@@ -78,25 +81,37 @@ func (d ScaleDirection) String() string {
 		return "down"
 	case ScaleDirectionUp:
 		return "up"
+	case ScaleDirectionRecommendation:
+		return "recommendation"
 	default:
 		return "none"
 	}
 }
 
-// Canonicalize ensures Action has proper default values.
+// Canonicalize ensures the action is safe for downstream mutation by
+// initializing Meta when it is nil.
 func (a *ScalingAction) Canonicalize() {
 	if a.Meta == nil {
-		a.Meta = make(map[string]interface{})
+		a.Meta = make(map[string]any)
 	}
+}
+
+// setMeta safely stores a metadata value, initializing Meta when needed.
+func (a *ScalingAction) setMeta(key string, val any) {
+	if a.Meta == nil {
+		a.Meta = make(map[string]any)
+	}
+	a.Meta[key] = val
 }
 
 // SetDryRun marks the Action to be executed in dry-run mode. Dry-run mode is
 // indicated using Meta tags. A dry-run action doesn't modify the Target's
 // count value.
 func (a *ScalingAction) SetDryRun() {
-	a.Meta[strategyActionMetaKeyDryRun] = true
-	a.Meta[strategyActionMetaKeyDryRunCount] = a.Count
+	a.setMeta(strategyActionMetaKeyDryRun, true)
+	a.setMeta(strategyActionMetaKeyDryRunCount, a.Count)
 	a.Count = StrategyActionMetaValueDryRunCount
+	a.Direction = ScaleDirectionNone
 }
 
 // CapCount caps the value of Count so it remains within the specified limits.
@@ -106,6 +121,8 @@ func (a *ScalingAction) CapCount(min, max int64) {
 		return
 	}
 
+	a.Canonicalize()
+
 	oldCount, newCount := a.Count, a.Count
 	if newCount < min {
 		newCount = min
@@ -114,8 +131,8 @@ func (a *ScalingAction) CapCount(min, max int64) {
 	}
 
 	if newCount != oldCount {
-		a.Meta[strategyActionMetaKeyCountCapped] = true
-		a.Meta[strategyActionMetaKeyCountOriginal] = oldCount
+		a.setMeta(strategyActionMetaKeyCountCapped, true)
+		a.setMeta(strategyActionMetaKeyCountOriginal, oldCount)
 		a.pushReason(fmt.Sprintf("capped count from %d to %d to stay within limits", oldCount, newCount))
 		a.Count = newCount
 	}
@@ -136,7 +153,7 @@ func (a *ScalingAction) pushReason(r string) {
 	if a.Reason != "" {
 		history = append(history, a.Reason)
 	}
-	a.Meta[strategyActionMetaKeyReasonHistory] = history
+	a.setMeta(strategyActionMetaKeyReasonHistory, history)
 	a.Reason = r
 }
 

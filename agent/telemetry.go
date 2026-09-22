@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package agent
@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
-	"github.com/armon/go-metrics/circonus"
-	"github.com/armon/go-metrics/datadog"
-	"github.com/armon/go-metrics/prometheus"
+	metrics "github.com/hashicorp/go-metrics"
+	"github.com/hashicorp/go-metrics/circonus"
+	"github.com/hashicorp/go-metrics/datadog"
+	"github.com/hashicorp/go-metrics/prometheus"
 	"github.com/hashicorp/nomad-autoscaler/agent/config"
 )
 

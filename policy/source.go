@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package policy
@@ -7,7 +7,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/armon/go-metrics"
+	"github.com/hashicorp/go-metrics"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 )
 
@@ -30,13 +30,6 @@ type MonitorIDsReq struct {
 	ResultCh chan<- IDMessage
 }
 
-type MonitorPolicyReq struct {
-	ID       PolicyID
-	ErrCh    chan<- error
-	ReloadCh <-chan struct{}
-	ResultCh chan<- sdk.ScalingPolicy
-}
-
 // Source is the interface that must be implemented by backends which provide
 // the canonical source for scaling policies.
 type Source interface {
@@ -55,7 +48,7 @@ type Source interface {
 	// so that config items can be reloaded gracefully without restarting the
 	// agent.
 	ReloadIDsMonitor()
-	MonitorPolicy(ctx context.Context, monitorPolicyReq MonitorPolicyReq)
+
 }
 
 // SourceName differentiates policies from different sources. This allows the
@@ -93,7 +86,7 @@ func HandleSourceError(name SourceName, err error, errCha chan<- error) {
 }
 
 // IDMessage encapsulates the required information that allows the policy
-// manager to launch the correct MonitorPolicy interface function where it
+// manager to launch the correct MonitorIDs interface function where it
 // needs to handle policies which originate from different sources.
 // It contains a map of PolicyID to a boolean indicating whether the policy was
 // recently updated.

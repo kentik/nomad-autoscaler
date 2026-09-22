@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package sdk
@@ -17,9 +17,11 @@ func TestScalingPolicy_Validate(t *testing.T) {
 		expectedError string
 	}{
 		{
-			name:          "nil policy",
-			policy:        nil,
-			expectedError: "",
+			name: "no type",
+			policy: &ScalingPolicy{
+				Type: "",
+			},
+			expectedError: "policy has not type defined",
 		},
 		{
 			name: "invalid on_check_error",
@@ -102,6 +104,15 @@ func TestScalingPolicy_Validate(t *testing.T) {
 			},
 			expectedError: "",
 		},
+		{
+			name: "empty checks",
+			policy: &ScalingPolicy{
+				Type:         "horizontal",
+				OnCheckError: "ignore",
+				Checks:       []*ScalingPolicyCheck{},
+			},
+			expectedError: "empty checks, this policy won't execute any verification or scaling and should have enabled set to false",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -144,6 +155,13 @@ func TestScalingPolicyTarget_IsNodePoolTarget(t *testing.T) {
 			expectedOutput: true,
 			name:           "datacenter input target",
 		},
+		{
+			inputScalingPolicyTarget: &ScalingPolicyTarget{
+				Config: map[string]string{"node_pool": "gpu"},
+			},
+			expectedOutput: true,
+			name:           "node_pool input target",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -169,15 +187,22 @@ func TestFileDecodePolicy_Translate(t *testing.T) {
 					CooldownHCL:           "10ms",
 					EvaluationInterval:    10 * time.Nanosecond,
 					EvaluationIntervalHCL: "10ns",
+					Schedule: &ScalingPolicySchedule{
+						Start: "0 9 * * *",
+						End:   "0 17 * * *",
+					},
 					Checks: []*FileDecodePolicyCheckDoc{
 						{
 							Name:                 "approach-speed",
 							Source:               "front-sensor",
 							Query:                "how-fast-am-i-going",
-							QueryWindow:          time.Minute,
-							QueryWindowHCL:       "1m",
+							QueryWindowHCL:       "instant",
 							QueryWindowOffset:    2 * time.Minute,
 							QueryWindowOffsetHCL: "2m",
+							Schedule: &ScalingPolicySchedule{
+								Start:    "0 12 * * *",
+								Duration: "2h",
+							},
 							Strategy: &ScalingPolicyStrategy{
 								Name: "approach-velocity",
 								Config: map[string]string{
@@ -201,13 +226,22 @@ func TestFileDecodePolicy_Translate(t *testing.T) {
 				Enabled:            true,
 				Cooldown:           10 * time.Millisecond,
 				EvaluationInterval: 10 * time.Nanosecond,
+				Schedule: &ScalingPolicySchedule{
+					Start: "0 9 * * *",
+					End:   "0 17 * * *",
+				},
 				Checks: []*ScalingPolicyCheck{
 					{
 						Name:              "approach-speed",
 						Source:            "front-sensor",
 						Query:             "how-fast-am-i-going",
-						QueryWindow:       time.Minute,
+						QueryWindow:       0,
 						QueryWindowOffset: 2 * time.Minute,
+						QueryInstant:      true,
+						Schedule: &ScalingPolicySchedule{
+							Start:    "0 12 * * *",
+							Duration: "2h",
+						},
 						Strategy: &ScalingPolicyStrategy{
 							Name: "approach-velocity",
 							Config: map[string]string{
@@ -224,6 +258,48 @@ func TestFileDecodePolicy_Translate(t *testing.T) {
 				},
 			},
 			name: "fully hydrated decoded policy",
+		},
+		{
+			inputFileDecodePolicy: &FileDecodeScalingPolicy{
+				Enabled: true,
+				Min:     1,
+				Max:     3,
+				Doc: &FileDecodePolicyDoc{
+					Checks: []*FileDecodePolicyCheckDoc{
+						{
+							Name:                 "approach-speed-range",
+							Source:               "front-sensor",
+							Query:                "how-fast-am-i-going",
+							QueryWindow:          5 * time.Minute,
+							QueryWindowHCL:       "5m",
+							QueryWindowOffset:    10 * time.Minute,
+							QueryWindowOffsetHCL: "10m",
+							Strategy: &ScalingPolicyStrategy{
+								Name: "approach-velocity",
+							},
+						},
+					},
+				},
+			},
+			expectedOutputPolicy: &ScalingPolicy{
+				Min:     1,
+				Max:     3,
+				Enabled: true,
+				Checks: []*ScalingPolicyCheck{
+					{
+						Name:              "approach-speed-range",
+						Source:            "front-sensor",
+						Query:             "how-fast-am-i-going",
+						QueryWindow:       5 * time.Minute,
+						QueryWindowOffset: 10 * time.Minute,
+						QueryInstant:      false,
+						Strategy: &ScalingPolicyStrategy{
+							Name: "approach-velocity",
+						},
+					},
+				},
+			},
+			name: "duration query window keeps non-instant internal state",
 		},
 	}
 

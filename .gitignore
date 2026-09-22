@@ -6,9 +6,6 @@ plugins/test/bin/
 # KENTIK override
 # pkg/
 
-# ignore GoLand IDE
-.idea
-
 # assets download path when using bob CLI
 .bob
 
@@ -22,5 +19,7 @@ example.nomad.hcl
 spec.hcl
 config.hcl
 
-# IDE config files
+# IDE config files and folders
+.idea/
 .vscode/
+.zed/

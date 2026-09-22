@@ -1,4 +1,4 @@
-# Copyright (c) HashiCorp, Inc.
+# Copyright IBM Corp. 2020, 2026
 # SPDX-License-Identifier: MPL-2.0
 
 schema = "1"
@@ -7,7 +7,7 @@ project "nomad-autoscaler" {
   // the team key is not used by CRT currently
   team = "nomad"
   slack {
-    notification_channel = "C03B5EWFW01"
+    notification_channel = "C09LCJBBNE5"
   }
   github {
     organization = "hashicorp"

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package strategy
@@ -16,6 +16,11 @@ type Strategy interface {
 	// Embed base.Base ensuring that strategy plugins implement this interface.
 	base.Base
 
+	Runner
+}
+
+type Runner interface {
+	// RunStrategy runs the strategy calculation for the given check evaluation
 	// Run triggers a run of the strategy calculation. It is responsible for
 	// populating the sdk.ScalingAction object within the passed eval and
 	// returning the eval to the caller. The count input variable represents
