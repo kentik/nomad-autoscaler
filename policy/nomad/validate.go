@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package nomad
@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad-autoscaler/plugins"
+	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/ptr"
 	"github.com/hashicorp/nomad/api"
 )
@@ -23,12 +24,14 @@ var nonMetricStrategies = map[string]bool{
 	plugins.InternalStrategyFixedValue: true,
 }
 
+const thresholdWithinBoundsTriggerConfigKey = "within_bounds_trigger"
+
 // validateScalingPolicy validates an api.ScalingPolicy object from the Nomad API
 func validateScalingPolicy(policy *api.ScalingPolicy) error {
 	var result *multierror.Error
 
 	if policy == nil {
-		return multierror.Append(result, errors.New("ScalingPolicy is nil"))
+		return multierror.Append(result, errors.New("ScalingPolicy is empty, this policy won't execute any verification or scaling and should have enabled set to false"))
 	}
 
 	// Validate ID.
@@ -54,9 +57,9 @@ func validateScalingPolicy(policy *api.ScalingPolicy) error {
 
 func validateScalingPolicyByType(policy *api.ScalingPolicy) error {
 	switch policy.Type {
-	case "horizontal", "":
+	case sdk.ScalingPolicyTypeHorizontal, "":
 		return validateHorizontalPolicy(policy)
-	case "cluster":
+	case sdk.ScalingPolicyTypeCluster:
 		return validateClusterPolicy(policy)
 	default:
 		return additionalPolicyTypeValidation(policy)
@@ -78,7 +81,7 @@ func validatePolicy(p map[string]interface{}) error {
 	var result *multierror.Error
 
 	if p == nil {
-		return multierror.Append(result, fmt.Errorf("%s is nil", path))
+		return multierror.Append(result, fmt.Errorf("empty policy, this policy won't execute any verification or scaling and should have enabled set to false"))
 	}
 
 	// Validate EvaluationInterval, if present.
@@ -90,9 +93,21 @@ func validatePolicy(p map[string]interface{}) error {
 	}
 
 	// Validate Cooldown, if present.
-	//   1. Cooldown should be a valid duration.
+	//   1. Cooldown and cooldownOnScaleUp should be a valid duration.
 	if cooldown, ok := p[keyCooldown]; ok {
 		if err := validateDuration(cooldown, path+"."+keyCooldown); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
+	if cooldownOnScaleUp, ok := p[keyCooldownOnScaleUp]; ok {
+		if err := validateDuration(cooldownOnScaleUp, path+"."+keyCooldownOnScaleUp); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
+	if scheduleInterface, ok := p[keySchedule]; ok {
+		if err := validateBlock(scheduleInterface, path+"."+keySchedule, validateSchedule); err != nil {
 			result = multierror.Append(result, err)
 		}
 	}
@@ -204,10 +219,10 @@ func validateCheck(c map[string]interface{}, path string, label string) error {
 	}
 
 	// Validate QueryWindow, if present.
-	//   1. QueryWindow should be a valid time duration.
+	//   1. QueryWindow should be a valid time duration or the literal "instant".
 	queryWindow, ok := c[keyQueryWindow]
 	if ok {
-		if err := validateDuration(queryWindow, path+"."+keyQueryWindow); err != nil {
+		if err := validateDurationOrInstant(queryWindow, path+"."+keyQueryWindow); err != nil {
 			result = multierror.Append(result, err)
 		}
 	}
@@ -231,7 +246,63 @@ func validateCheck(c map[string]interface{}, path string, label string) error {
 		result = multierror.Append(result, strategyErrs)
 	}
 
+	if err := validateInstantThresholdTrigger(c, path); err != nil {
+		result = multierror.Append(result, err)
+	}
+
+	if scheduleInterface, ok := c[keySchedule]; ok {
+		if err := validateBlock(scheduleInterface, path+"."+keySchedule, validateSchedule); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
 	return result.ErrorOrNil()
+}
+
+func validateSchedule(in map[string]interface{}, path string) error {
+	schedule := &sdk.ScalingPolicySchedule{}
+
+	if start, ok := in["start"].(string); ok {
+		schedule.Start = start
+	}
+	if end, ok := in["end"].(string); ok {
+		schedule.End = end
+	}
+	if duration, ok := in["duration"].(string); ok {
+		schedule.Duration = duration
+	}
+
+	if err := sdk.ValidateScalingPolicySchedule(schedule); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+func validateInstantThresholdTrigger(c map[string]interface{}, path string) error {
+	queryWindow, ok := c[keyQueryWindow].(string)
+	if !ok || queryWindow != "instant" {
+		return nil
+	}
+
+	strategyBlocks := parseBlocks(c[keyStrategy])
+	thresholdBlock, ok := strategyBlocks[plugins.InternalStrategyThreshold]
+	if !ok {
+		return nil
+	}
+
+	thresholdConfig := parseBlock(thresholdBlock)
+	if thresholdConfig == nil {
+		return nil
+	}
+
+	trigger, ok := thresholdConfig[thresholdWithinBoundsTriggerConfigKey]
+	if !ok || fmt.Sprintf("%v", trigger) != "1" {
+		return fmt.Errorf("%s.%s[%s].%s must be set to 1 when %s.%s = %q",
+			path, keyStrategy, plugins.InternalStrategyThreshold,
+			thresholdWithinBoundsTriggerConfigKey, path, keyQueryWindow, "instant")
+	}
+
+	return nil
 }
 
 // validateStrategy validates strategy blocks within a policy check.
@@ -295,6 +366,23 @@ func validateDuration(d interface{}, path string) error {
 
 	if _, err := time.ParseDuration(dStr); err != nil {
 		return fmt.Errorf(`%s must have time.Duration format, found "%s"`, path, dStr)
+	}
+
+	return nil
+}
+
+func validateDurationOrInstant(d interface{}, path string) error {
+	dStr, ok := d.(string)
+	if !ok {
+		return fmt.Errorf("%s must be string, found %T", path, d)
+	}
+
+	if dStr == "instant" {
+		return nil
+	}
+
+	if _, err := time.ParseDuration(dStr); err != nil {
+		return fmt.Errorf("%s must have time.Duration format or be \"instant\", found %q", path, dStr)
 	}
 
 	return nil
@@ -378,7 +466,7 @@ func validateBlocks(in interface{}, path string, validator validatorFunc) error 
 	var result *multierror.Error
 
 	if in == nil {
-		return multierror.Append(result, fmt.Errorf("%s is nil", path))
+		return multierror.Append(result, fmt.Errorf("empty checks, this policy won't execute any verification or scaling and should have enabled set to false"))
 	}
 
 	inList, ok := in.([]interface{})

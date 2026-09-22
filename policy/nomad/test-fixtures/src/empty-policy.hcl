@@ -1,8 +1,7 @@
-# Copyright (c) HashiCorp, Inc.
+# Copyright IBM Corp. 2020, 2025
 # SPDX-License-Identifier: MPL-2.0
 
 job "empty-policy" {
-  datacenters = ["dc1"]
 
   group "test" {
     scaling {

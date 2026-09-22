@@ -13,6 +13,9 @@ GO_TEST_CMD = $(if $(shell command -v gotestsum 2>/dev/null),gotestsum --,go tes
 # Respect $GOBIN if set in environment or via $GOENV file.
 BIN := $(shell go env GOBIN)
 ifndef BIN
+ifndef GOPATH
+GOPATH := $(shell go env GOPATH)
+endif
 BIN := $(GOPATH)/bin
 endif
 
@@ -33,7 +36,8 @@ tools: lint-tools test-tools generate-tools
 generate-tools: ## Install the tools used to generate code
 	@echo "==> Installing code generate tools..."
 	go install github.com/bufbuild/buf/cmd/buf@v1.45.0
-	go install github.com/golang/protobuf/protoc-gen-go@v1.5.3
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
 	@echo "==> Done"
 
 .PHONY: test-tools
@@ -45,7 +49,7 @@ test-tools: ## Install the tools used to run tests
 .PHONY: lint-tools
 lint-tools: ## Install the tools used to lint
 	@echo "==> Installing lint tools..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.5
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.1
 	go install honnef.co/go/tools/cmd/staticcheck@2025.1
 	go install github.com/hashicorp/go-hclog/hclogvet@feaf6d2ec20fd895e711195c99e3fde93a68afc5
 	go install github.com/hashicorp/hcl/v2/cmd/hclfmt@d0c4fa8b0bbc2e4eeccd1ed2a32c2089ed8c5cf1
@@ -67,7 +71,7 @@ pkg/%.zip: pkg/%/nomad-autoscaler ## Build and zip Nomad Autoscaler for GOOS_GOA
 	zip -j $@ $(dir $<)*
 
 .PHONY: dev
-dev: lint ## Build for the current development version
+dev: hclfmt ## Build for the current development version
 	@echo "==> Building autoscaler..."
 	@CGO_ENABLED=0 GOPROXY=direct go build \
 		-ldflags $(GO_LDFLAGS) \
@@ -83,10 +87,10 @@ proto: ## Generate the protocol buffers
 	@echo "==> Done"
 
 .PHONY: lint
-lint: lint-tools generate-tools hclfmt ## Lint the source code
+lint: hclfmt ## Lint the source code
 	@echo "==> Linting source code..."
 	@GOPROXY=direct \
-	golangci-lint run -j 1 --build-tags "$(GO_TAGS)" --timeout=8m
+	golangci-lint run -j 1 --build-tags "$(GO_TAGS)" --timeout=15m
 	@staticcheck ./...
 	@hclogvet .
 	@buf lint --config=./tools/buf/buf.yaml
@@ -134,7 +138,7 @@ test: ## Test the source code
 	@$(MAKE) -C plugins/test
 	@echo "==> Testing source code..."
 	@GOPROXY=direct \
-    	$(GO_TEST_CMD) -v -race -cover ./... -tags "$(GO_TAGS)"
+		$(GO_TEST_CMD) -v -race -cover ./... -tags "$(GO_TAGS)"
 	@echo "==> Done"
 
 .PHONY: clean-plugins
@@ -215,6 +219,12 @@ bin/plugins/gce-mig:
 	@cd ./plugins/builtin/target/gce-mig && go build -o ../../../../$@
 	@echo "==> Done"
 
+bin/plugins/ibmcloud-ig:
+	@echo "==> Building $@..."
+	@mkdir -p $$(dirname $@)
+	@cd ./plugins/builtin/target/ibmcloud-ig && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../../../../$@
+	@echo "==> Done"
+
 .PHONY: plugins
 plugins: \
 	bin/plugins/nomad-apm \
@@ -226,6 +236,7 @@ plugins: \
 	bin/plugins/threshold \
 	bin/plugins/aws-asg \
 	bin/plugins/datadog \
+	bin/plugins/ibmcloud-ig \
 	bin/plugins/azure-vmss \
 	bin/plugins/gce-mig
 

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package policy
@@ -8,313 +8,453 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	hclog "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/nomad-autoscaler/plugins/manager"
+	metrics "github.com/hashicorp/go-metrics"
+	"github.com/hashicorp/nomad-autoscaler/plugins"
+	"github.com/hashicorp/nomad-autoscaler/plugins/apm"
+	"github.com/hashicorp/nomad-autoscaler/plugins/strategy"
+	targetpkg "github.com/hashicorp/nomad-autoscaler/plugins/target"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
-	errHelper "github.com/hashicorp/nomad-autoscaler/sdk/helper/error"
 )
 
+// handlerState is the representation of the current occupation of the handler,
+// it works as a state machine with the following rules:
+//
+//     ┌─────────────────────────────────────────────────────────────────────────────┐
+//     │                                                                             │
+//     │                                                                             │
+// ┌───▼────┐ new action   ┌────────────┐ slot  ┌───────────┐ success ┌────────────┐ │
+// │ Idle   ├──────────────► OnWaiting  ┼──────►│ Scaling   ├─────────►OnCooldown  ┼─┘
+// └───▲────┘              └─────┬──────┘       └─────┬─────┘         └────────────┘
+//     │                         │                    │
+//     │         timeout error   │  scaling error     │
+//     └─────────────────────────┴────────────────────┘
+//
+
+type handlerState int
+
 const (
-	cooldownIgnoreTime = 1 * time.Second
+	StateScaling handlerState = iota
+	StateWaitingTurn
+	StateCooldown
+	StateIdle
 )
+
+var (
+	// errTargetNotFound is used by a check handler to indicate the policy target
+	// does not exist or is unavailable.
+	errTargetNotFound = errors.New("target not found")
+	errNoMetrics      = errors.New("no metrics available")
+)
+
+type dependencyGetter interface {
+	GetAPMLooker(source string) (apm.Looker, error)
+	GetStrategyRunner(name string) (strategy.Runner, error)
+}
+
+type limiter interface {
+	GetSlot(ctx context.Context, p *sdk.ScalingPolicy) error
+	ReleaseSlot(p *sdk.ScalingPolicy)
+}
+
+type checker interface {
+	runCheckAndCapCount(ctx context.Context, currentCount int64, cache *queryMetricsCache) (sdk.ScalingAction, error)
+	group() string
+}
 
 // Handler monitors a policy for changes and controls when them are sent for
 // evaluation.
 type Handler struct {
 	log hclog.Logger
 
-	// policyID is the ID of the policy the handler is responsible for.
-	policyID PolicyID
-
-	// pluginManager is used to retrieve an instance of the target plugin used
-	// by the policy.
-	pluginManager *manager.PluginManager
-
-	// policySource is used to monitor for changes to the policy the handler
-	// is responsible for.
-	policySource Source
-
 	// mutators is a list of mutations to apply to policies.
 	mutators []Mutator
+
+	policyLock sync.RWMutex
+	policy     *sdk.ScalingPolicy
+
+	// Compiled schedule cached from policy.Schedule for runtime window checks.
+	compiledPolicySchedule *compiledSchedule
+
+	checkRunners []checker
+
+	targetController targetpkg.Controller
+
+	limiter limiter
+
+	// ch is used to listen for policy updates.
+	updatesCh <-chan *sdk.ScalingPolicy
 
 	// ticker controls the frequency the policy is sent for evaluation.
 	ticker *time.Ticker
 
-	// cooldownCh is used to notify the handler that it should enter a cooldown
-	// period.
-	cooldownCh chan time.Duration
+	stateLock sync.RWMutex
+	state     handlerState
 
-	// running is used to help keep track if the handler is active or not.
-	running     bool
-	runningLock sync.RWMutex
+	actionLock sync.RWMutex
+	nextAction sdk.ScalingAction
 
-	// ch is used to listen for policy updates.
-	ch chan sdk.ScalingPolicy
+	cooldownLock    sync.RWMutex
+	outOfCooldownOn time.Time
 
-	// errCh is used to listen for errors from the policy source.
-	errCh chan error
+	pm dependencyGetter
 
-	// doneCh is used to signal the handler to stop.
-	doneCh chan struct{}
-
-	// reloadCh is used to communicate to the MonitorPolicy routine that it
-	// should perform a reload.
-	reloadCh chan struct{}
+	// Ent only field
+	evaluateAfter       time.Duration
+	historicalAPMGetter HistoricalAPMGetter
 }
 
-// NewHandler returns a new handler for a policy.
-func NewHandler(ID PolicyID, log hclog.Logger, pm *manager.PluginManager, ps Source) *Handler {
-	return &Handler{
-		policyID:      ID,
-		log:           log.Named("policy_handler").With("policy_id", ID),
-		pluginManager: pm,
-		policySource:  ps,
+type HandlerConfig struct {
+	UpdatesChan      chan *sdk.ScalingPolicy
+	Policy           *sdk.ScalingPolicy
+	Log              hclog.Logger
+	TargetController targetpkg.Controller
+	Limiter          *Limiter
+	DependencyGetter dependencyGetter
+
+	// Ent only field
+	HistoricalAPMGetter HistoricalAPMGetter
+	EvaluateAfter       time.Duration
+}
+
+func NewPolicyHandler(config HandlerConfig) (*Handler, error) {
+	h := &Handler{
+		log: config.Log,
 		mutators: []Mutator{
 			NomadAPMMutator{},
 		},
-		ch:         make(chan sdk.ScalingPolicy),
-		errCh:      make(chan error),
-		doneCh:     make(chan struct{}),
-		cooldownCh: make(chan time.Duration, 1),
-		reloadCh:   make(chan struct{}),
+		pm:                  config.DependencyGetter,
+		targetController:    config.TargetController,
+		updatesCh:           config.UpdatesChan,
+		policy:              config.Policy,
+		limiter:             config.Limiter,
+		stateLock:           sync.RWMutex{},
+		state:               StateIdle,
+		historicalAPMGetter: config.HistoricalAPMGetter,
+		evaluateAfter:       config.EvaluateAfter,
 	}
+
+	if err := h.applyPolicyState(h.policy); err != nil {
+		return nil, fmt.Errorf("failed to initialize policy state: %w", err)
+	}
+
+	currentStatus, err := h.runTargetStatus()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get target status: %w", err)
+	}
+
+	// A nil status indicates the target doesn't exist or is not ready, log and
+	// continue
+	if currentStatus == nil {
+		h.log.Warn("target not found", "target", h.policy.Target.Name)
+	}
+
+	lastEventTS, err := checkForOutOfBandEvents(currentStatus)
+	if err != nil {
+		h.log.Warn("unable to get out of band event", "target", h.policy.Target.Name,
+			"error", err)
+	}
+
+	if lastEventTS > 0 {
+		// For out of band events, it is impossible to determine the direction
+		// of the last action, assume the shortest period for responsiveness.
+		h.updateState(StateCooldown)
+
+		rcd := calculateRemainingCooldown(h.policy.CooldownOnScaleUp,
+			nowFunc().UTC().UnixNano(), lastEventTS)
+		time.AfterFunc(rcd, func() {
+			h.updateState(StateIdle)
+		})
+	}
+
+	return h, nil
 }
 
-// Run starts the handler and periodically sends the policy for evaluation.
+// checkForOutOfBandEvents tries to determine if there has been any recent
+// scaling events in case of the autoscaler going offline.
+func checkForOutOfBandEvents(status *sdk.TargetStatus) (int64, error) {
+	// If the target status includes a last event meta key, check for cooldown
+	// due to out-of-band events. This is also useful if the Autoscaler has
+	// been re-deployed.
+	if status.Meta == nil {
+		return 0, nil
+	}
+
+	ts, ok := status.Meta[sdk.TargetStatusMetaKeyLastEvent]
+	if !ok {
+		return 0, nil
+	}
+
+	return strconv.ParseInt(ts, 10, 64)
+}
+
+// applyPolicyState validates and atomically applies policy-derived state.
+// Caller must ensure exclusive access after Run starts (for example, hold
+// policyLock). It is safe during initialization.
+func (h *Handler) applyPolicyState(policy *sdk.ScalingPolicy) error {
+	if policy == nil {
+		return errors.New("handler policy cannot be nil")
+	}
+
+	// Load check runners for the new policy to validate it before applying
+	checkRunners, err := h.loadCheckRunners(policy)
+	if err != nil {
+		return err
+	}
+
+	// Re-compile schedule for validation before applying.
+	compiledSchedule, err := compileSchedule(policy.Schedule)
+	if err != nil {
+		return err
+	}
+
+	// Everything is successful, update the handler's internal state.
+	h.policy = policy
+	h.compiledPolicySchedule = compiledSchedule
+	h.checkRunners = checkRunners
+
+	return nil
+}
+
+func (h *Handler) loadCheckRunners(policy *sdk.ScalingPolicy) ([]checker, error) {
+	runners := []checker{}
+
+	switch policy.Type {
+	case sdk.ScalingPolicyTypeCluster, sdk.ScalingPolicyTypeHorizontal:
+		for i, check := range policy.Checks {
+			if check == nil {
+				return nil, fmt.Errorf("invalid check at index %d: check cannot be nil", i)
+			}
+
+			if check.Strategy == nil || check.Strategy.Name == "" {
+				return nil, fmt.Errorf("invalid check %q: missing strategy value", check.Name)
+			}
+
+			strategyName := check.Strategy.Name
+
+			s, err := h.pm.GetStrategyRunner(strategyName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get strategy %s: %w", strategyName, err)
+			}
+
+			var mg apm.Looker
+			// Fixed-value strategy does not need APM; keep looker nil and skip APM lookup.
+			if strategyName != plugins.InternalStrategyFixedValue {
+				mg, err = h.pm.GetAPMLooker(check.Source)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get APM for strategy %s: %w", strategyName, err)
+				}
+			}
+
+			runner := newCheckRunner(&CheckRunnerConfig{
+				Log: h.log.Named("check_handler").With("check", check.Name,
+					"source", check.Source, "strategy", strategyName),
+				StrategyRunner: s,
+				MetricsGetter:  mg,
+				Policy:         policy,
+			}, check)
+
+			runners = append(runners, runner)
+
+		}
+
+	case sdk.ScalingPolicyTypeVerticalCPU, sdk.ScalingPolicyTypeVerticalMem:
+		runner, err := h.loadVerticalCheckRunner(policy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load vertical check %s: %w", policy.Type, err)
+		}
+
+		runners = append(runners, runner)
+	}
+
+	return runners, nil
+}
+
+//	Run starts the handler for the given policy
 //
-// This function blocks until the context provided is canceled or the handler
-// is stopped with the Stop() method.
-func (h *Handler) Run(ctx context.Context, evalCh chan<- *sdk.ScalingEvaluation) {
+// This function blocks until the context provided is canceled.
+func (h *Handler) Run(ctx context.Context) {
+	h.ticker = time.NewTicker(h.policy.EvaluationInterval)
+	defer h.ticker.Stop()
+
 	h.log.Trace("starting policy handler")
-
-	defer h.Stop()
-
-	// Mark the handler as running.
-	h.runningLock.Lock()
-	h.running = true
-	h.runningLock.Unlock()
-
-	// Store a local copy of the policy so we can compare it for changes.
-	var currentPolicy *sdk.ScalingPolicy
-
-	// Start with a long ticker until we receive the right interval.
-	// TODO(luiz): make this a config param
-	policyReadTimeout := 3 * time.Minute
-	h.ticker = time.NewTicker(policyReadTimeout)
-
-	// Create separate context so we can stop the monitoring Go routine if
-	// doneCh is closed, but ctx is still valid.
-	monitorCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Start monitoring the policy for changes.
-	req := MonitorPolicyReq{ID: h.policyID, ErrCh: h.errCh, ReloadCh: h.reloadCh, ResultCh: h.ch}
-	go h.policySource.MonitorPolicy(monitorCtx, req)
 
 	for {
 		select {
 		case <-ctx.Done():
-			h.log.Trace("stopping policy handler due to context done")
-			return
-		case <-h.doneCh:
-			h.log.Trace("stopping policy handler due to done channel")
+			h.log.Error("stopping policy handler due to context done")
 			return
 
-		case err := <-h.errCh:
-			// In case of error, log the error message and loop around.
-			// Handlers never stop running unless ctx.Done() or doneCh is
-			// closed.
-			if err == nil {
+		case updatedPolicy := <-h.updatesCh:
+			// The policy can be nil if the channel is closed meaning the
+			// handler is being removed, let the context cancelation take
+			// care of returning.
+			if updatedPolicy == nil {
 				continue
 			}
 
-			// multierror.Error objects are logged differently to allow for a
-			// more structured output.
-			merr, ok := err.(*multierror.Error)
-			if ok && len(merr.Errors) > 1 {
-				// Transform Errors into a slice of strings to avoid logging
-				// empty objects when using JSON format.
-				errors := make([]string, len(merr.Errors))
-				for i, e := range merr.Errors {
-					errors[i] = e.Error()
-				}
-				h.log.Error(errors[0], "errors", errors[1:])
-			} else {
-				if errHelper.APIErrIs(err, http.StatusNotFound, "not found") {
-					// the policy is gone, so this handler should stop,
-					// but the monitor manager will handle that.
-					// here we just log for potential future debugging.
-					h.log.Debug("policy gone away", "message", err)
-				} else {
-					h.log.Error("encountered an error monitoring policy", "error", err)
-				}
+			h.applyMutators(updatedPolicy)
+			if err := h.updateHandler(updatedPolicy); err != nil {
+				h.log.Error("encountered a runtime error while executing the policy", "error", err)
 			}
-			continue
-
-		case p := <-h.ch:
-			h.applyMutators(&p)
-			h.updateHandler(currentPolicy, &p)
-			currentPolicy = &p
 
 		case <-h.ticker.C:
-			eval, err := h.handleTick(ctx, currentPolicy)
-			if err != nil {
-				if err == context.Canceled {
-					// Context was canceled, return to stop the handler.
-					return
-				}
-				h.log.Error(err.Error())
+			if h.compiledPolicySchedule != nil && !h.compiledPolicySchedule.activeAt(nowFunc()) {
+				h.log.Info("skipping evaluation, outside schedule window")
 				continue
 			}
 
-			if eval != nil {
-				evalCh <- eval
+			currentStatus, err := h.runTargetStatus()
+			if err != nil {
+				h.log.Error("encountered a runtime error while executing the policy",
+					"error", fmt.Errorf("handler: failed to get target status for target: %s, %w",
+						h.policy.Target.Name, err))
+				continue
 			}
 
-		case ts := <-h.cooldownCh:
-			// Enforce the cooldown which will block until complete.
-			if !h.enforceCooldown(ctx, ts) {
-				// Context was canceled, return to stop the handler.
-				return
+			// A nil status indicates the target doesn't exist, log and return.
+			if currentStatus == nil {
+				h.log.Error("encountered a runtime error while executing the policy", "error", errTargetNotFound)
+				continue
+			}
+
+			if !currentStatus.Ready {
+				h.log.Debug("skipping evaluation, target not ready")
+				continue
+			}
+
+			currentCount := currentStatus.Count
+			action, err := h.calculateNewCount(ctx, currentCount)
+			if err != nil {
+				// Returning here avoids re-entering the ticker case on a canceled/expired context;
+				//  ctx.Done() would win on the next iteration anyway but Go's select is non-deterministic.
+				if ctx.Err() != nil {
+					h.log.Debug("stopping policy handler, context done during evaluation")
+					return
+				}
+				h.log.Error("encountered a runtime error while executing the policy",
+					"error", fmt.Errorf("handler: unable to execute policy ID: %s, %w",
+						h.policy.ID, err))
+				continue
+			}
+
+			h.log.Info("calculating scaling target", "policy_id", h.policy.ID,
+				"from", currentCount, "to",
+				action.Count, "reason", action.Reason, "meta", action.Meta)
+
+			if !scalingNeeded(action, currentCount) {
+				h.log.Info("skipping scaling, no action needed")
+				continue
+			}
+
+			h.updateNextAction(action)
+
+			if nowFunc().After(h.getOutOfCooldownOn()) &&
+				h.getState() == StateCooldown {
+				h.updateState(StateIdle)
+			}
+
+			switch h.getState() {
+			case StateCooldown:
+				h.log.Info("skipping scaling, policy still on cooldown", "remaining",
+					time.Until(h.getOutOfCooldownOn()))
+
+			case StateWaitingTurn:
+				h.log.Debug("updating action, waiting to execute")
+
+			case StateScaling:
+				h.log.Info("skipping scaling, target still scaling")
+
+			case StateIdle:
+				h.log.Debug("requesting slot")
+				h.updateState(StateWaitingTurn)
+
+				go func() {
+					err := h.waitAndScale(ctx)
+					if err != nil {
+						h.updateState(StateIdle)
+						h.log.Error("unable to scale target", "reason", err)
+					}
+				}()
 			}
 		}
 	}
 }
 
-// Stop stops the handler and the monitoring Go routine.
-func (h *Handler) Stop() {
-	h.runningLock.Lock()
-	defer h.runningLock.Unlock()
-
-	if h.running {
-		h.log.Trace("stopping handler")
-		h.ticker.Stop()
-		close(h.doneCh)
+// scalingNeeded determines if the action requires a change from the current
+// count.
+func scalingNeeded(a sdk.ScalingAction, currentCount int64) bool {
+	if a.Direction == sdk.ScaleDirectionRecommendation {
+		// used only for Enterprise Dynamic Application Sizing (DAS)
+		return a.Count != currentCount
 	}
-
-	h.running = false
+	if a.Direction == sdk.ScaleDirectionNone {
+		return false
+	}
+	return a.Count != currentCount
 }
 
-func (h *Handler) handleTick(ctx context.Context, policy *sdk.ScalingPolicy) (*sdk.ScalingEvaluation, error) {
-	h.log.Trace("tick")
-
-	if policy == nil {
-		// Initial ticker ticked without a policy being set, assume we are not able
-		// to retrieve the policy and exit.
-		return nil, errors.New("timeout: failed to read policy in time")
-	}
-
-	// Validate policy on ticker so any validation errors are resurfaced
-	// periodically.
-	err := policy.Validate()
+func (h *Handler) waitAndScale(ctx context.Context) error {
+	err := h.limiter.GetSlot(ctx, h.policy)
 	if err != nil {
-		return nil, fmt.Errorf("invalid policy: %v", err)
+		return fmt.Errorf("timeout waiting for execution time: %w", err)
 	}
 
-	// Timestamp the invocation of this evaluation run. This can be
-	// used when checking cooldown or emitting metrics to ensure some
-	// consistency.
-	curTime := time.Now().UTC().UnixNano()
+	defer h.limiter.ReleaseSlot(h.policy)
 
-	// Exit early if the policy is not enabled.
-	if !policy.Enabled {
-		h.log.Debug("policy is not enabled")
-		return nil, nil
+	h.log.Debug("slot granted")
+
+	action := h.getNextAction()
+	h.updateState(StateScaling)
+
+	// Measure how long it takes to invoke the scaling actions. This helps
+	// understand the time taken to interact with the remote target and action
+	// the scaling action.
+	labels := []metrics.Label{
+		{Name: "policy_id", Value: h.policy.ID},
+		{Name: "target_name", Value: h.policy.Target.Name},
 	}
+	defer metrics.MeasureSinceWithLabels([]string{"scale", "invoke_ms"},
+		nowFunc(), labels)
 
-	target, err := h.pluginManager.GetTarget(policy.Target)
+	err = h.runTargetScale(action)
 	if err != nil {
-		h.log.Warn("failed to get target", "error", err)
-		return nil, err
+		var noOpErr *sdk.TargetScalingNoOpError
+		if errors.As(err, &noOpErr) {
+			h.log.Debug("scaling action was a no-op, skipping cooldown", "reason", noOpErr.Error())
+			h.updateState(StateIdle)
+			return nil
+		}
+		return fmt.Errorf("failed to get scale target: %w", err)
 	}
 
-	status, err := target.Status(policy.Target.Config)
-	if err != nil {
-		h.log.Warn("failed to get target status", "error", err)
-		return nil, err
-	}
+	h.updateState(StateCooldown)
+	cd := calculateCooldown(h.policy, action)
+	h.updateOutOfCooldownOn(nowFunc().Add(cd))
+	h.log.Debug("successfully submitted scaling action to target, scaling policy has been placed into cooldown",
+		"desired_count", action.Count, "cooldown", cd)
 
-	// A nil status indicates the target doesn't exist, so we don't need to
-	// monitor the policy anymore.
-	if status == nil {
-		h.log.Trace("target doesn't exist anymore", "target", policy.Target.Config)
-		h.Stop()
-		return nil, nil
-	}
-
-	// Exit early if the target is not ready yet.
-	if !status.Ready {
-		h.log.Trace("target is not ready")
-		return nil, nil
-	}
-
-	// Send policy for evaluation.
-	h.log.Trace("sending policy for evaluation")
-
-	eval := sdk.NewScalingEvaluation(policy)
-	// If the evaluation is nil there is nothing to be done this time
-	// around.
-	if eval == nil {
-		return nil, nil
-	}
-
-	// If the target status includes a last event meta key, check for cooldown
-	// due to out-of-band events. This is also useful if the Autoscaler has
-	// been re-deployed.
-	ts, ok := status.Meta[sdk.TargetStatusMetaKeyLastEvent]
-	if !ok {
-		return eval, nil
-	}
-
-	// Convert the last event string. If an error occurs, just log and
-	// continue with the evaluation. A malformed timestamp shouldn't mean
-	// we skip scaling.
-	lastTS, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		h.log.Error("failed to parse last event timestamp as int64", "error", err)
-		return eval, nil
-	}
-
-	// Calculate the remaining time period left on the cooldown. If this is
-	// cooldownIgnoreTime or below, we do not need to enter cooldown. Reasoning
-	// on ignoring small variations can be seen within GH-138.
-	cdPeriod := h.calculateRemainingCooldown(policy.Cooldown, curTime, lastTS)
-	if cdPeriod <= cooldownIgnoreTime {
-		return eval, nil
-	}
-
-	// Enforce the cooldown which will block until complete. A false response
-	// means we did not reach the end of cooldown due to a request to shutdown.
-	if !h.enforceCooldown(ctx, cdPeriod) {
-		return nil, context.Canceled
-	}
-
-	// If we reach this point, we have entered and exited cooldown. Our data is
-	// stale, therefore return so that we do not send the eval this time and
-	// wait for the next tick.
-	return nil, nil
+	return nil
 }
 
 // updateHandler updates the handler's internal state based on the changes in
 // the policy being monitored.
-func (h *Handler) updateHandler(current, next *sdk.ScalingPolicy) {
-	if current == nil {
-		h.log.Trace("received policy")
-	} else {
-		h.log.Trace("received policy change")
-		h.log.Trace(cmp.Diff(current, next))
+func (h *Handler) updateHandler(updatedPolicy *sdk.ScalingPolicy) error {
+	h.log.Trace("updating handler", "policy_id", updatedPolicy.ID)
+
+	h.policyLock.Lock()
+	intervalChanged := h.policy.EvaluationInterval != updatedPolicy.EvaluationInterval
+	err := h.applyPolicyState(updatedPolicy)
+	h.policyLock.Unlock()
+	if err != nil {
+		return fmt.Errorf("unable to build and apply updated policy state for policy ID %s: %w", updatedPolicy.ID, err)
 	}
 
-	// Update ticker if it's the first time we receive the policy or if the
-	// policy's evaluation interval has changed.
-	if current == nil || current.EvaluationInterval != next.EvaluationInterval {
+	if intervalChanged {
 		h.ticker.Stop()
 
 		// Add a small random delay between 0 and 300ms to spread the first
@@ -322,44 +462,11 @@ func (h *Handler) updateHandler(current, next *sdk.ScalingPolicy) {
 		splayNs := rand.Intn(30) * 100 * 1000 * 1000
 		time.Sleep(time.Duration(splayNs))
 
-		h.ticker = time.NewTicker(next.EvaluationInterval)
+		h.ticker = time.NewTicker(updatedPolicy.EvaluationInterval)
 	}
-}
 
-// enforceCooldown blocks until the cooldown period has been reached, or the
-// handler has been instructed to exit. The boolean return details whether or
-// not the cooldown period passed without being interrupted.
-func (h *Handler) enforceCooldown(ctx context.Context, t time.Duration) (complete bool) {
-
-	// Log that cooldown is being enforced. This is very useful as cooldown
-	// blocks the ticker making this the only indication of cooldown to
-	// operators.
-	h.log.Debug("scaling policy has been placed into cooldown", "cooldown", t)
-
-	// Using a timer directly is mentioned to be more efficient than
-	// time.After() as long as we ensure to call Stop(). So setup a timer for
-	// use and defer the stop.
-	timer := time.NewTimer(t)
-	defer timer.Stop()
-
-	// Cooldown should not mean we miss other handler control signals. So wait
-	// on all the channels desired here.
-	select {
-	case <-timer.C:
-		complete = true
-		return
-	case <-ctx.Done():
-		return
-	case <-h.doneCh:
-		return
-	}
-}
-
-// calculateRemainingCooldown calculates the remaining cooldown based on the
-// time since the last event. The remaining period can be negative, indicating
-// no cooldown period is required.
-func (h *Handler) calculateRemainingCooldown(cd time.Duration, ts, lastEvent int64) time.Duration {
-	return cd - time.Duration(ts-lastEvent)
+	h.log.Debug("check handlers updated", "count", len(h.checkRunners))
+	return nil
 }
 
 // applyMutators applies the mutators registered with the handler in order and
@@ -370,4 +477,219 @@ func (h *Handler) applyMutators(p *sdk.ScalingPolicy) {
 			h.log.Info("policy modified", "modification", mutation)
 		}
 	}
+}
+
+// calculateNewCount is the main part of the controller, it
+// gets the metrics and the necessary new count to keep up with the policy
+// and generates a scaling action if needed.
+func (h *Handler) calculateNewCount(ctx context.Context, currentCount int64) (sdk.ScalingAction, error) {
+	h.log.Debug("received policy for evaluation")
+
+	// Record the start time of the eval portion of this function. The labels
+	// are also used across multiple metrics, so define them.
+	evalStartTime := nowFunc()
+	labels := []metrics.Label{
+		{Name: "policy_id", Value: h.policy.ID},
+		{Name: "target_name", Value: h.policy.Target.Name},
+	}
+
+	// Store check results by group so we can compare their results together.
+	checkGroups := make(map[string][]checkResult)
+	queryCache := newQueryMetricsCache()
+
+	for _, ch := range h.checkRunners {
+		action, err := ch.runCheckAndCapCount(ctx, currentCount, queryCache)
+		if err != nil {
+			if errors.Is(err, errCheckOutsideSchedule) {
+				h.log.Debug("skipping check, outside schedule window")
+				continue
+			}
+			return sdk.ScalingAction{}, fmt.Errorf("failed to run check and cap count: %w", err)
+		}
+
+		g := ch.group()
+		checkGroups[g] = append(checkGroups[g], checkResult{
+			action:  &action,
+			handler: ch,
+			group:   g,
+		})
+	}
+
+	winner := pickWinnerActionFromGroups(checkGroups)
+	if winner.handler == nil || winner.action == nil {
+		return sdk.ScalingAction{}, nil
+	}
+
+	h.log.Debug("check selected", "direction", winner.action.Direction,
+		"count", winner.action.Count)
+
+	// At this point the checks have finished. Therefore emit of metric data
+	// tracking how long it takes to run all the checks within a policy.
+	metrics.MeasureSinceWithLabels([]string{"scale", "evaluate_ms"}, evalStartTime, labels)
+
+	if winner.action.Count == sdk.StrategyActionMetaValueDryRunCount {
+		h.log.Debug("registering scaling event",
+			"count", currentCount, "reason", winner.action.Reason, "meta", winner.action.Meta)
+	}
+
+	return *winner.action, nil
+}
+
+// runTargetStatus wraps the target.Status call to provide operational
+// functionality.
+func (h *Handler) runTargetStatus() (*sdk.TargetStatus, error) {
+
+	// Trigger a metric measure to track latency of the call.
+	labels := []metrics.Label{{Name: "plugin_name", Value: h.policy.Target.Name}, {Name: "policy_id", Value: h.policy.ID}}
+	defer metrics.MeasureSinceWithLabels([]string{"plugin", "target", "status", "invoke_ms"}, time.Now(), labels)
+
+	return h.targetController.Status(h.policy.Target.Config)
+}
+
+// runTargetScale wraps the target.Scale call to provide operational
+// functionality.
+func (h *Handler) runTargetScale(action sdk.ScalingAction) error {
+
+	// If the policy is configured with dry-run:true then we set the
+	// action count to nil so its no-nop. This allows us to still
+	// submit the job, but not alter its state.
+	if val, ok := h.policy.Target.Config["dry-run"]; ok && val == "true" {
+		h.log.Info("scaling dry-run is enabled, using no-op task group count")
+		action.SetDryRun()
+	}
+
+	labels := []metrics.Label{
+		{Name: "policy_id", Value: h.policy.ID},
+		{Name: "target_name", Value: h.policy.Target.Name},
+		{Name: "plugin_name", Value: h.policy.Target.Name},
+	}
+
+	// Trigger a metric measure to track latency of the call.
+	defer metrics.MeasureSinceWithLabels([]string{"plugin", "target", "scale", "invoke_ms"}, time.Now(), labels)
+	h.log.Debug("scaling target", "target", h.policy.Target.Name, "count", action.Count)
+
+	err := h.targetController.Scale(action, h.policy.Target.Config)
+	if err != nil {
+		metrics.IncrCounterWithLabels([]string{"scale", "invoke", "error_count"}, 1, labels)
+		return err
+	}
+	metrics.IncrCounterWithLabels([]string{"scale", "invoke", "success_count"}, 1, labels)
+
+	return nil
+}
+
+func calculateCooldown(p *sdk.ScalingPolicy, a sdk.ScalingAction) time.Duration {
+	if a.Direction == sdk.ScaleDirectionUp {
+		return p.CooldownOnScaleUp
+	}
+
+	return p.Cooldown
+}
+
+// pickWinnerActionFromGroups decide which action wins in the group.
+// The decision processes still picks the safest choice, but it handles `none`
+//
+//	actions a little differently.
+//
+// Since grouped checks have corelated metrics, it's expected that most
+// checks will result in `none` actions as the data will be somewhere
+// else. So we ignore none actions unless _all_ checks in the group
+// vote for `none` to avoid accidentally scaling down when comparing
+// with other groups.
+func pickWinnerActionFromGroups(checkGroups map[string][]checkResult) checkResult {
+	var winner checkResult
+	for group, results := range checkGroups {
+
+		var groupWinner checkResult
+
+		noneCount := 0
+		for _, r := range results {
+			if r.action == nil {
+				continue
+			}
+
+			if group != "" && r.action.Direction == sdk.ScaleDirectionNone {
+				noneCount += 1
+				continue
+			}
+			groupWinner = groupWinner.preempt(r)
+		}
+
+		// If all checks result in `none`, pick any one of them so when we
+		// don't scale down accidentally when comparing it with other groups.
+		if noneCount > 0 && noneCount == len(results) {
+			groupWinner = results[0]
+		}
+
+		if groupWinner.handler == nil {
+			continue
+		}
+
+		winner = winner.preempt(groupWinner)
+	}
+
+	return winner
+}
+
+func (h *Handler) getState() handlerState {
+	h.stateLock.RLock()
+	defer h.stateLock.RUnlock()
+
+	return h.state
+}
+
+func (h *Handler) updateState(hs handlerState) {
+	h.stateLock.Lock()
+	defer h.stateLock.Unlock()
+
+	h.state = hs
+}
+
+func (h *Handler) getNextAction() sdk.ScalingAction {
+	h.actionLock.RLock()
+	defer h.actionLock.RUnlock()
+
+	return h.nextAction
+}
+
+func (h *Handler) updateNextAction(a sdk.ScalingAction) {
+	h.actionLock.Lock()
+	defer h.actionLock.Unlock()
+
+	h.nextAction = a
+}
+
+func (h *Handler) getOutOfCooldownOn() time.Time {
+	h.cooldownLock.RLock()
+	defer h.cooldownLock.RUnlock()
+
+	return h.outOfCooldownOn
+}
+
+func (h *Handler) updateOutOfCooldownOn(ooc time.Time) {
+	h.cooldownLock.Lock()
+	defer h.cooldownLock.Unlock()
+
+	h.outOfCooldownOn = ooc
+}
+
+// calculateRemainingCooldown calculates the remaining cooldown based on the
+// time since the last event. The remaining period can be negative, indicating
+// no cooldown period is required.
+func calculateRemainingCooldown(cd time.Duration, ts, lastEvent int64) time.Duration {
+	return cd - time.Duration(ts-lastEvent)
+}
+
+type checkResult struct {
+	action  *sdk.ScalingAction
+	handler checker
+	group   string
+}
+
+func (c checkResult) preempt(other checkResult) checkResult {
+	winner := sdk.PreemptScalingAction(c.action, other.action)
+	if winner == c.action {
+		return c
+	}
+	return other
 }

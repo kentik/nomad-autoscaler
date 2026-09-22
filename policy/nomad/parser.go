@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package nomad
@@ -23,11 +23,12 @@ func parsePolicy(p *api.ScalingPolicy) sdk.ScalingPolicy {
 	}
 
 	to := sdk.ScalingPolicy{
-		ID:      p.ID,
-		Type:    p.Type,
-		Max:     *p.Max, // Nomad always ensures Max is populated.
-		Enabled: true,
-		Checks:  parseChecks(p.Policy[keyChecks]),
+		ID:       p.ID,
+		Type:     p.Type,
+		Max:      *p.Max, // Nomad always ensures Max is populated.
+		Enabled:  true,
+		Checks:   parseChecks(p.Policy[keyChecks]),
+		Schedule: parseSchedule(p.Policy[keySchedule]),
 	}
 
 	// Add non-typed values.
@@ -45,10 +46,16 @@ func parsePolicy(p *api.ScalingPolicy) sdk.ScalingPolicy {
 		to.EvaluationInterval, _ = time.ParseDuration(eval)
 	}
 
-	// Parse cooldown as time.Duraction
+	// Parse cooldown as time.Duration
 	// Ignore error since we assume policy has been validated.
 	if cooldown, ok := p.Policy[keyCooldown].(string); ok {
 		to.Cooldown, _ = time.ParseDuration(cooldown)
+	}
+
+	// Parse cooldownOnScaleUp as time.Duration
+	// Ignore error since we assume policy has been validated.
+	if cooldownOnScaleUp, ok := p.Policy[keyCooldownOnScaleUp].(string); ok {
+		to.CooldownOnScaleUp, _ = time.ParseDuration(cooldownOnScaleUp)
 	}
 
 	// Parse on_check_error.
@@ -152,8 +159,13 @@ func parseCheck(c interface{}) *sdk.ScalingPolicyCheck {
 	// Parse query_window and query_window_offset ignoring errors since we
 	// assume policy has been validated.
 	var queryWindow, queryWindowOffset time.Duration
+	var queryInstant bool
 	if queryWindowStr, ok := checkMap[keyQueryWindow].(string); ok {
-		queryWindow, _ = time.ParseDuration(queryWindowStr)
+		if queryWindowStr == "instant" {
+			queryInstant = true
+		} else {
+			queryWindow, _ = time.ParseDuration(queryWindowStr)
+		}
 	}
 	if queryWindowOffsetStr, ok := checkMap[keyQueryWindowOffset].(string); ok {
 		queryWindowOffset, _ = time.ParseDuration(queryWindowOffsetStr)
@@ -164,9 +176,32 @@ func parseCheck(c interface{}) *sdk.ScalingPolicyCheck {
 		Query:             query,
 		QueryWindow:       queryWindow,
 		QueryWindowOffset: queryWindowOffset,
+		QueryInstant:      queryInstant,
+		Schedule:          parseSchedule(checkMap[keySchedule]),
 		Source:            source,
 		Strategy:          strategy,
 		OnError:           on_error,
+	}
+}
+
+func parseSchedule(s interface{}) *sdk.ScalingPolicySchedule {
+	if s == nil {
+		return nil
+	}
+
+	scheduleMap := parseBlock(s)
+	if scheduleMap == nil {
+		return nil
+	}
+
+	start, _ := scheduleMap["start"].(string)
+	end, _ := scheduleMap["end"].(string)
+	duration, _ := scheduleMap["duration"].(string)
+
+	return &sdk.ScalingPolicySchedule{
+		Start:    start,
+		End:      end,
+		Duration: duration,
 	}
 }
 

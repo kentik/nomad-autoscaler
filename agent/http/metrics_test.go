@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package http
@@ -32,7 +32,7 @@ func TestServer_getMetrics(t *testing.T) {
 			inputReq:             httptest.NewRequest("GET", "/v1/metrics", nil),
 			inputWriter:          httptest.NewRecorder(),
 			expectedRespCode:     200,
-			expectedRespContains: "Counters\":[],\"Gauges\":[],\"Points\":[],\"Samples\":[]",
+			expectedRespContains: `"Counters":[],"Gauges":[],"Points":[],"PrecisionGauges":null,"Samples":[]`,
 			enableProm:           false,
 			name:                 "correct request for JSON metrics",
 		},

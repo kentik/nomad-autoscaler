@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package ha
@@ -123,10 +123,6 @@ func (t *testSource) MonitorIDs(ctx context.Context, req policy.MonitorIDsReq) {
 			req.ErrCh <- err
 		}
 	}
-}
-
-func (t *testSource) MonitorPolicy(ctx context.Context, req policy.MonitorPolicyReq) {
-	panic("implement me")
 }
 
 func (t *testSource) Name() policy.SourceName {

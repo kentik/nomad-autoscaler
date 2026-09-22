@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2020, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package manager
@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
+	metrics "github.com/hashicorp/go-metrics"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad-autoscaler/agent/config"
@@ -375,6 +375,10 @@ func (pm *PluginManager) pluginInfo(id plugins.PluginID, raw interface{}) (*base
 	return pluginInfo, nil
 }
 
+func (pm *PluginManager) GetTargetController(target *sdk.ScalingPolicyTarget) (targetpkg.Controller, error) {
+	return pm.GetTarget(target)
+}
+
 func (pm *PluginManager) GetTarget(target *sdk.ScalingPolicyTarget) (targetpkg.Target, error) {
 	// Dispense an instance of target plugin used by the policy.
 	targetPlugin, err := pm.Dispense(target.Name, sdk.PluginTypeTarget)
@@ -391,6 +395,10 @@ func (pm *PluginManager) GetTarget(target *sdk.ScalingPolicyTarget) (targetpkg.T
 	return targetInst, nil
 }
 
+func (pm *PluginManager) GetAPMLooker(source string) (apm.Looker, error) {
+	return pm.GetAPM(source)
+}
+
 func (pm *PluginManager) GetAPM(source string) (apm.APM, error) {
 	// Dispense plugins.
 	apmPlugin, err := pm.Dispense(source, sdk.PluginTypeAPM)
@@ -402,6 +410,10 @@ func (pm *PluginManager) GetAPM(source string) (apm.APM, error) {
 		return nil, fmt.Errorf(`"%s" is not an APM plugin`, source)
 	}
 	return apmInst, nil
+}
+
+func (pm *PluginManager) GetStrategyRunner(name string) (strategy.Runner, error) {
+	return pm.GetStrategy(name)
 }
 
 func (pm *PluginManager) GetStrategy(name string) (strategy.Strategy, error) {
