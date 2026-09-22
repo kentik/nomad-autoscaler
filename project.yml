@@ -14,8 +14,8 @@ nomad:
     branch: main
 docker:
   build:
-    base: kt-build-generic-bullseye:master
+    base: kt-build-generic-trixie:master
   run:
-    base: kt-run-generic-bullseye:master
+    base: kt-run-generic-trixie:master
 team_mappings:
 - team: infra
